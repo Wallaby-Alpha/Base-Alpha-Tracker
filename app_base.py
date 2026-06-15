@@ -99,12 +99,7 @@ def moralis_get(path: str, api_key: str, params: dict = None) -> dict:
         )
         r.raise_for_status()
         return r.json()
-    except Exception as e:
-        st.error(f"Moralis error: {e}")
-        try:
-            st.write(r.json())
-        except Exception:
-            st.write(r.text if 'r' in dir() else "no response")
+    except Exception:
         return {}
 
 
