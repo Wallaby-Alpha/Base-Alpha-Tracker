@@ -117,393 +117,6 @@ def get_wallet_tokens(wallet: str, api_key: str) -> list:
     return data.get("result", [])
 
 
-def wallet_usd_value(tokens: list) -> float:
-    """Sum USD value across all tokens in a wallet."""
-    total = 0.0
-    for t in tokens:
-        # Moralis returns usd_value as a string or None
-        val = t.get("usd_value")
-        if val is not None:
-            try:
-                total += float(val)
-            except (ValueError, TypeError):
-                pass
-    return total
-
-
-def assign_cohort(usd: float) -> str:
-    for b in COHORT_BRACKETS:
-        if b["min_usd"] <= usd < b["max_usd"]:
-            return b["name"]
-    return "Minnow 🦐"
-
-
-def normalise_address(addr: str) -> str:
-    """Lowercase EVM addresses for consistent comparison."""
-    return addr.lower().strip() if addr else ""
-
-
-def detect_address_col(df: pd.DataFrame):
-    """Find the column that looks like EVM wallet addresses."""
-    for col in df.columns:
-        if df[col].astype(str).str.match(r"^0x[0-9a-fA-F]{40}$").any():
-            return col
-    return None
-
-
-def parse_wallets_from_csv(uploaded) -> list:
-    df = pd.read_csv(io.BytesIO(uploaded.read()))
-    col = detect_address_col(df)
-    if not col:
-        return []
-    return (
-        df[col].dropna().astype(str)
-        .str.strip().str.lower()
-        .unique().tolist()
-    )
-
-
-# ── global sidebar: API key + remember me ────────────────────────────────────
-with st.sidebar:
-    st.title("🔵 Base Wallet Intel")
-    st.markdown("---")
-
-    # localStorage bridge — saves key client-side only
-    components.html("""
-<script>
-(function() {
-    const saved = localStorage.getItem('moralis_api_key');
-    if (saved) {
-        window.parent.postMessage({type: 'moralis_key', key: saved}, '*');
-    }
-})();
-window.addEventListener('message', function(e) {
-    if (e.data && e.data.type === 'save_moralis_key')
-        localStorage.setItem('moralis_api_key', e.data.key);
-    if (e.data && e.data.type === 'clear_moralis_key')
-        localStorage.removeItem('moralis_api_key');
-});
-</script>
-""", height=0)
-
-    if "moralis_key_value" not in st.session_state:
-        st.session_state["moralis_key_value"] = ""
-
-    moralis_key = st.text_input(
-        "Moralis API Key",
-        type="password",
-        placeholder="Paste key — stays in your browser",
-        value=st.session_state["moralis_key_value"],
-        key="moralis_key_input",
-    )
-    remember = st.checkbox("Remember in this browser", value=True)
-
-    if moralis_key:
-        st.session_state["moralis_key_value"] = moralis_key
-        if remember:
-            components.html(f"""
-<script>
-window.parent.postMessage({{type: 'save_moralis_key', key: '{moralis_key}'}}, '*');
-</script>
-""", height=0)
-        else:
-            components.html("""
-<script>
-window.parent.postMessage({type: 'clear_moralis_key'}, '*');
-</script>
-""", height=0)
-
-    if not moralis_key:
-        st.info("💡 Saved key auto-fills after page load.")
-
-    st.markdown("---")
-    st.caption("Get a free key at [moralis.io](https://moralis.io)")
-    st.markdown("---")
-    st.markdown("**How to get a holder CSV:**")
-    st.caption(
-        "Base doesn't offer free holder exports. Options:\n"
-        "- [Dune Analytics](https://dune.com) — query `tokens_base.transfers` for a token contract\n"
-        "- [Bubblemaps](https://bubblemaps.io) — export holder list from token page\n"
-        "- [Basescan](https://basescan.org) token holders page (manual copy)\n\n"
-        "CSV just needs one column of `0x...` addresses."
-    )
-
-
-# ── tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3 = st.tabs(["🐋 Cohort Analyzer", "🔍 Whale Overlap", "📅 Recent Buys"])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 1 — COHORT ANALYZER
-# ══════════════════════════════════════════════════════════════════════════════
-with tab1:
-    st.header("Cohort Analyzer")
-    st.caption("Classify Base token holders by total wallet net worth.")
-
-    with st.expander("ℹ️ How to use", expanded=False):
-        st.markdown("""
-1. **Prepare a CSV of Base wallet addresses.** Any CSV with a column of `0x...` addresses works — the app detects the address column automatically. Ways to get one:
-   - **Dune Analytics:** query `tokens_base.transfers` or `erc20_base.evt_Transfer` for a token contract and export holder addresses
-   - **Bubblemaps:** go to a token page → export holder list
-   - **Basescan:** token holders page (manual copy/paste into spreadsheet, save as CSV)
-   - **Your own list:** one address per row is fine
-2. Upload the CSV below and hit **Run Cohort Analysis**
-3. Results bucket each wallet into Whale / Shark / Dolphin / Fish / Minnow tiers by total portfolio value
-4. Whales, Sharks & Dolphins are automatically passed to the **Whale Overlap** and **Recent Buys** tabs
-""")
-
-    c1_file = st.file_uploader("Upload holder CSV", type=["csv"], key="c1_file")
-    c1_max  = st.slider("Max wallets", 10, MAX_WALLETS, 50, 10, key="c1_max")
-    c1_btn  = st.button(
-        "🚀 Run Cohort Analysis", type="primary",
-        disabled=not (moralis_key and c1_file), key="c1_btn",
-    )
-
-    if c1_btn:
-        wallets = parse_wallets_from_csv(c1_file)
-        if not wallets:
-            st.error("No valid Base (0x...) addresses found in CSV.")
-            st.stop()
-        if len(wallets) > c1_max:
-            st.info(f"CSV has {len(wallets)} addresses — analyzing top {c1_max}.")
-            wallets = wallets[:c1_max]
-
-        st.markdown("---")
-        prog   = st.progress(0)
-        status = st.empty()
-
-        cohort_buckets = defaultdict(list)
-        rows = []
-
-        for i, wallet in enumerate(wallets):
-            status.text(f"[{i+1}/{len(wallets)}] {wallet[:12]}...")
-            tokens    = get_wallet_tokens(wallet, moralis_key)
-            net_worth = wallet_usd_value(tokens)
-            label     = assign_cohort(net_worth)
-            cohort_buckets[label].append({"wallet": wallet, "net_worth": net_worth})
-            rows.append({"wallet": wallet, "net_worth_usd": round(net_worth, 2), "cohort": label})
-            prog.progress((i + 1) / len(wallets))
-            time.sleep(0.15)
-
-        status.empty()
-        prog.empty()
-
-        # Save whales+sharks+dolphins for other tabs
-        big_wallets = [
-            r["wallet"] for r in rows
-            if r["cohort"] in ("Whale 🐋", "Shark 🦈", "Dolphin 🐬")
-        ]
-        st.session_state["whale_wallets"] = big_wallets
-        if big_wallets:
-            st.success(f"✅ {len(big_wallets)} Whale/Shark/Dolphin wallets saved — available in Whale Overlap and Recent Buys tabs.")
-
-        # Distribution metrics
-        st.markdown("---")
-        st.subheader("📊 Distribution")
-        total = len(wallets)
-        cols  = st.columns(len(COHORT_BRACKETS))
-        for col, bracket in zip(cols, COHORT_BRACKETS):
-            count = len(cohort_buckets[bracket["name"]])
-            col.metric(bracket["name"], count, f"{count/total*100:.1f}%")
-
-        # Per-cohort tables
-        st.markdown("---")
-        st.subheader("🏷️ Holders by Cohort")
-        for bracket in COHORT_BRACKETS:
-            members = cohort_buckets[bracket["name"]]
-            if not members:
-                continue
-            with st.expander(f"{bracket['name']}  ·  {len(members)} holders"):
-                df_out = pd.DataFrame([
-                    {"Wallet": m["wallet"], "Net Worth (USD)": f"${m['net_worth']:,.2f}"}
-                    for m in sorted(members, key=lambda x: -x["net_worth"])
-                ])
-                st.dataframe(df_out, use_container_width=True, hide_index=True)
-
-        # Download
-        st.markdown("---")
-        csv_bytes = (
-            pd.DataFrame(rows)
-            .sort_values("net_worth_usd", ascending=False)
-            .to_csv(index=False).encode()
-        )
-        st.download_button("⬇️ Download results CSV", csv_bytes, "holder_cohorts_base.csv", "text/csv")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TAB 2 — WHALE OVERLAP
-# ══════════════════════════════════════════════════════════════════════════════
-with tab2:
-    st.header("Whale Overlap")
-    st.caption("See what tokens a group of wallets share — find what the big players are all holding.")
-
-    with st.expander("ℹ️ How to use", expanded=False):
-        st.markdown("""
-**Two ways to load wallets:**
-- Run the Cohort Analyzer first → Whales, Sharks & Dolphins auto-populate here
-- Or paste wallet addresses directly (one per line)
-
-Results show every token held by 2+ of the wallets, ranked by how many wallets share it.
-Stablecoins and WETH are filtered out automatically.
-""")
-
-    source = st.radio(
-        "Wallet source",
-        ["Use Whales/Sharks/Dolphins from Cohort tab", "Paste wallets manually", "Upload new CSV"],
-        key="t2_source",
-        horizontal=True,
-    )
-
-    t2_wallets = []
-
-    if source == "Use Whales/Sharks/Dolphins from Cohort tab":
-        saved = st.session_state.get("whale_wallets", [])
-        if saved:
-            st.success(f"{len(saved)} wallets loaded from Cohort Analysis (Whales, Sharks & Dolphins).")
-            t2_wallets = saved
-            with st.expander("View wallets"):
-                for w in saved:
-                    st.code(w)
-        else:
-            st.info("Run the Cohort Analyzer first to populate this automatically.")
-
-    elif source == "Paste wallets manually":
-        raw = st.text_area(
-            "Paste wallet addresses (one per line)",
-            height=150,
-            placeholder="0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045\n...",
-            key="t2_paste",
-        )
-        if raw.strip():
-            t2_wallets = [
-                w.strip().lower() for w in raw.strip().splitlines()
-                if w.strip().startswith("0x") and len(w.strip()) == 42
-            ]
-            st.caption(f"{len(t2_wallets)} addresses detected.")
-
-    else:
-        t2_file = st.file_uploader("Upload wallet CSV", type=["csv"], key="t2_file")
-        if t2_file:
-            t2_wallets = parse_wallets_from_csv(t2_file)
-            if t2_wallets:
-                st.caption(f"{len(t2_wallets)} addresses found.")
-            else:
-                st.error("No valid Base (0x...) addresses detected in CSV.")
-
-    t2_max     = st.slider("Max wallets to scan", 5, MAX_WALLETS, 30, 5, key="t2_max")
-    min_shared = st.slider("Min wallets sharing a token (filter noise)", 2, 10, 2, 1, key="t2_min")
-
-    t2_btn = st.button(
-        "🔍 Run Overlap Analysis",
-        type="primary",
-        disabled=not (moralis_key and t2_wallets),
-        key="t2_btn",
-    )
-
-    if t2_btn:
-        wallets = t2_wallets[:t2_max]
-        if len(t2_wallets) > t2_max:
-            st.info(f"Capped to {t2_max} wallets.")
-
-        st.markdown("---")
-        prog2   = st.progress(0)
-        status2 = st.empty()
-
-        token_counts   = defaultdict(int)
-        token_metadata = {}
-        token_holders  = defaultdict(list)
-
-        for i, wallet in enumerate(wallets):
-            status2.text(f"[{i+1}/{len(wallets)}] {wallet[:12]}...")
-            tokens = get_wallet_tokens(wallet, moralis_key)
-            seen_this_wallet = set()
-
-            for t in tokens:
-                addr = normalise_address(t.get("token_address", ""))
-                if not addr or addr in SKIP_TOKENS:
-                    continue
-                # Skip tokens with no balance
-                try:
-                    bal = float(t.get("balance_formatted", 0) or 0)
-                except (ValueError, TypeError):
-                    bal = 0
-                if bal <= 0 or addr in seen_this_wallet:
-                    continue
-
-                seen_this_wallet.add(addr)
-                token_counts[addr] += 1
-                token_holders[addr].append(wallet)
-
-                if addr not in token_metadata:
-                    try:
-                        price = float(t.get("usd_price", 0) or 0)
-                    except (ValueError, TypeError):
-                        price = 0.0
-                    token_metadata[addr] = {
-                        "symbol":    t.get("symbol", "???"),
-                        "name":      t.get("name", "Unknown"),
-                        "price_usd": price,
-                    }
-
-            prog2.progress((i + 1) / len(wallets))
-            time.sleep(0.15)
-
-        status2.empty()
-        prog2.empty()
-
-        shared        = {m: c for m, c in token_counts.items() if c >= min_shared}
-        sorted_tokens = sorted(shared.items(), key=lambda x: -x[1])
-
-        if not sorted_tokens:
-            st.warning(f"No tokens found shared by {min_shared}+ wallets.")
-        else:
-            st.subheader(f"🏆 {len(sorted_tokens)} shared tokens found")
-
-            summary_rows = []
-            for addr, count in sorted_tokens[:50]:
-                meta = token_metadata[addr]
-                summary_rows.append({
-                    "Symbol":          meta["symbol"],
-                    "Name":            meta["name"],
-                    "Wallets Holding": count,
-                    "% of Group":      f"{count/len(wallets)*100:.1f}%",
-                    "Price (USD)":     f"${meta['price_usd']:,.6f}" if meta["price_usd"] > 0 else "—",
-                    "Contract":        addr,
-                })
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
-
-            st.markdown("---")
-            st.subheader("🔎 Token Detail")
-            for addr, count in sorted_tokens[:30]:
-                meta    = token_metadata[addr]
-                holders = token_holders[addr]
-                pct     = count / len(wallets) * 100
-                with st.expander(f"**{meta['symbol']}** — {count} wallets ({pct:.1f}%)  ·  {meta['name']}"):
-                    st.caption(f"Contract: `{addr}`")
-                    basescan_url = f"https://basescan.org/token/{addr}"
-                    st.markdown(f"[View on Basescan]({basescan_url})")
-                    if meta["price_usd"] > 0:
-                        st.caption(f"Price: ${meta['price_usd']:,.6f}")
-                    for h in holders:
-                        st.code(h)
-
-            st.markdown("---")
-            dl_rows = []
-            for addr, count in sorted_tokens:
-                meta = token_metadata[addr]
-                for h in token_holders[addr]:
-                    dl_rows.append({
-                        "contract":        addr,
-                        "symbol":          meta["symbol"],
-                        "name":            meta["name"],
-                        "wallets_holding": count,
-                        "wallet":          h,
-                    })
-            csv2 = pd.DataFrame(dl_rows).to_csv(index=False).encode()
-            st.download_button("⬇️ Download overlap CSV", csv2, "whale_overlap_base.csv", "text/csv")
-
-
-# ── acquisition helpers (Tab 3) ───────────────────────────────────────────────
 def get_erc20_transfers_in(wallet: str, api_key: str, from_date: str) -> list:
     """
     Fetch all inbound ERC-20 transfers to `wallet` on Base since `from_date` (ISO string).
@@ -513,15 +126,19 @@ def get_erc20_transfers_in(wallet: str, api_key: str, from_date: str) -> list:
     cursor = None
     while True:
         params = {
-            "chain":      CHAIN,
-            "from_date":  from_date,
-            "limit":      100,
-            "order":      "DESC",
+            "chain":     CHAIN,
+            "from_date": from_date,
+            "limit":     100,
+            "order":     "DESC",
         }
         if cursor:
             params["cursor"] = cursor
 
         data = moralis_get(f"/{wallet}/erc20/transfers", api_key, params=params)
+
+        # DEBUG: uncomment to inspect raw API response
+        # st.write(data)
+
         results = data.get("result", [])
         if not results:
             break
@@ -543,7 +160,10 @@ def parse_inflow_events(transfers: list, wallet: str) -> list:
     """Convert raw Moralis transfer records into normalised inflow dicts."""
     inflows = []
     for tx in transfers:
-        token_addr = normalise_address(tx.get("address", ""))
+        # FIX: Moralis returns the token contract under "token_address",
+        # not "address" — this was the field causing every transfer to
+        # be silently dropped.
+        token_addr = normalise_address(tx.get("token_address", ""))
         if not token_addr or token_addr in SKIP_TOKENS:
             continue
 
@@ -577,8 +197,6 @@ def parse_inflow_events(transfers: list, wallet: str) -> list:
             "wallet":          wallet,
         })
     return inflows
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 #  TAB 3 — RECENT ACQUISITIONS
 # ══════════════════════════════════════════════════════════════════════════════
