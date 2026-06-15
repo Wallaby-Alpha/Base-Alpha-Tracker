@@ -184,7 +184,7 @@ def get_erc20_transfers_in(wallet: str, api_key: str, from_date: str) -> list:
         data = moralis_get(f"/{wallet}/erc20/transfers", api_key, params=params)
 
         # DEBUG: uncomment to inspect raw API response
-         st.write(data)
+        st.write(data)
 
         results = data.get("result", [])
         if not results:
